@@ -1532,6 +1532,7 @@ async function resetAccountTraffic(env) {
     const id = activeDeviceId.replace(/-/g, "").toLowerCase();
     if (!sysUsageCache.accounts) sysUsageCache.accounts = {};
     sysUsageCache.accounts[id] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split("T")[0] };
+    delete sysUsageCache.users;
     await cachedD1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
 }
 
@@ -1600,13 +1601,26 @@ function accountUsage() {
     const cleanId = activeDeviceId.replace(/-/g, "").toLowerCase();
     const usage = sysUsageCache?.accounts?.[cleanId] || { reqs: 0, dReqs: 0, lastDay: "" };
     const today = new Date().toISOString().split("T")[0];
+    const totalBytes = Math.floor((usage.reqs || 0) * (1073741824 / 6000));
+    const dailyBytes = Math.floor((usage.lastDay === today ? (usage.dReqs || 0) : 0) * (1073741824 / 6000));
+    const limitBytes = Math.floor((sysConfig.limitTotalReq || 0) * (1073741824 / 6000));
     return {
         totalRequests: usage.reqs || 0,
         totalGB: Number(((usage.reqs || 0) / 6000).toFixed(2)),
+        totalBytes,
+        total: totalBytes,
+        uploadBytes: 0,
+        downloadBytes: totalBytes,
         dailyRequests: usage.lastDay === today ? (usage.dReqs || 0) : 0,
         dailyGB: Number(((usage.lastDay === today ? (usage.dReqs || 0) : 0) / 6000).toFixed(2)),
+        dailyBytes,
+        daily: usage.lastDay === today ? (usage.dReqs || 0) : 0,
         totalLimitRequests: sysConfig.limitTotalReq || 0,
         totalLimitGB: sysConfig.limitTotalReq ? Number((sysConfig.limitTotalReq / 6000).toFixed(2)) : 0,
+        totalLimitBytes: limitBytes,
+        limit: limitBytes,
+        dailyLimit: 0,
+        remainingBytes: limitBytes ? Math.max(0, limitBytes - totalBytes) : 0,
         expiryMs: sysConfig.expiryMs || 0
     };
 }
