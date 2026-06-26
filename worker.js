@@ -32,6 +32,7 @@ const SYSTEM_DEFAULTS = {
     subUserAgent: "",
     customPanelUrl: "",
     limitTotalReq: 0,
+    limitTotalBytes: 0,
     expiryMs: 0,
     account: {
         id: "",
@@ -74,6 +75,7 @@ const API_SETTINGS_SCHEMA = Object.freeze({
     subUserAgent: "string",
     customPanelUrl: "string",
     limitTotalReq: "number",
+    limitTotalBytes: "number",
     expiryMs: "number",
     account: "object"
 });
@@ -206,17 +208,12 @@ function getTransportParams(port) {
 }
 
 function getSubscriptionStats(targetSub = null) {
-    let id = activeDeviceId;
-    let limitTotalReq = sysConfig.limitTotalReq || 0;
+    const snap = accountUsageSnapshot();
     let expiryMs = sysConfig.expiryMs || 0;
-    
-    let idClean = id.replace(/-/g, '').toLowerCase();
-    let sysU = sysUsageCache?.accounts?.[idClean] || { reqs: 0, dReqs: 0 };
-    let totalReqs = sysU.reqs || 0;
-    
-    let totalGb = (totalReqs / 6000).toFixed(2);
-    let limitTotalGb = limitTotalReq ? (limitTotalReq / 6000).toFixed(2) : 'Unlimited';
-    
+
+    let totalGb = (snap.total / 1073741824).toFixed(2);
+    let limitTotalGb = snap.limitBytes ? (snap.limitBytes / 1073741824).toFixed(2) : 'Unlimited';
+
     let expiryDateTxt = 'Never Expire';
     let remDaysTxt = 'Never Expire';
     if (expiryMs) {
@@ -245,9 +242,8 @@ function getAllProfiles(targetSub = null) {
     let skip = false;
     if (sysConfig.expiryMs && Date.now() > sysConfig.expiryMs) skip = true;
     if (sysConfig.isPaused || account.isPaused) skip = true;
-    const cleanId = activeDeviceId.replace(/-/g, '').toLowerCase();
-    const usage = sysUsageCache?.accounts?.[cleanId];
-    if (sysConfig.limitTotalReq && usage && usage.reqs >= sysConfig.limitTotalReq) skip = true;
+    const limitBytes = configLimitBytes();
+    if (limitBytes && accountUsageSnapshot().total >= limitBytes) skip = true;
     if (skip) return [];
     return [{
         id: activeDeviceId,
@@ -1294,6 +1290,14 @@ const CACHE_TTL_CONFIG = 10000;
 const CACHE_TTL_USAGE = 10000;
 const CACHE_TTL_BACKUP_IP = 30000;
 
+const GIB = 1073741824;
+// Legacy estimate used only as a fallback for accounts created before precise
+// byte accounting existed (records that carry request counts but no up/down).
+const LEGACY_BYTES_PER_REQ = GIB / 6000;
+// Persist usage to D1 frequently so a recycled isolate loses at most a few
+// seconds of counted bytes. Accuracy is prioritised over worker resource use.
+const USAGE_PERSIST_INTERVAL = 5000;
+
 let sysConfigCacheTime = 0;
 let sysUsageCacheTime = 0;
 let backupIpCache = null;
@@ -1384,6 +1388,7 @@ function normalizeConfig(rawConfig = {}) {
     next.namePrefix = next.namePrefix || "Mezdia";
     next.mode = ["alpha", "beta", "both"].includes(next.mode) ? next.mode : "alpha";
     next.limitTotalReq = Number(next.limitTotalReq || migratedUser?.limitTotalReq || 0);
+    next.limitTotalBytes = Number(next.limitTotalBytes || migratedUser?.limitTotalBytes || 0);
     next.expiryMs = Number(next.expiryMs || migratedUser?.expiryMs || 0);
     next.account.id = next.account.id || next.deviceId || "";
     next.account.name = next.account.name || "Default";
@@ -1392,8 +1397,192 @@ function normalizeConfig(rawConfig = {}) {
 
 function normalizeUsage(rawUsage) {
     const usage = rawUsage && typeof rawUsage === "object" ? rawUsage : {};
-    const accounts = usage.accounts || usage.users || {};
+    const rawAccounts = usage.accounts || usage.users || {};
+    const accounts = {};
+    for (const [id, rec] of Object.entries(rawAccounts || {})) {
+        accounts[id] = normalizeUsageRecord(rec);
+    }
     return { accounts };
+}
+
+function todayKey() {
+    return new Date().toISOString().split("T")[0];
+}
+
+function normalizeUsageRecord(rec) {
+    const r = rec && typeof rec === "object" ? rec : {};
+    return {
+        up: Math.max(0, Math.floor(Number(r.up) || 0)),
+        down: Math.max(0, Math.floor(Number(r.down) || 0)),
+        dUp: Math.max(0, Math.floor(Number(r.dUp) || 0)),
+        dDown: Math.max(0, Math.floor(Number(r.dDown) || 0)),
+        reqs: Math.max(0, Math.floor(Number(r.reqs) || 0)),
+        dReqs: Math.max(0, Math.floor(Number(r.dReqs) || 0)),
+        lastDay: typeof r.lastDay === "string" && r.lastDay ? r.lastDay : todayKey(),
+        resetAt: Math.max(0, Math.floor(Number(r.resetAt) || 0))
+    };
+}
+
+// mergeUsageRecord combines an in-memory record with one loaded from D1 without
+// losing counts. Cumulative totals only ever move forward (take the max), so
+// bytes that an isolate has counted but not yet persisted survive a reload. A
+// more recent resetAt wins outright so an admin traffic reset still takes hold.
+function mergeUsageRecord(memRec, diskRec) {
+    const a = normalizeUsageRecord(memRec);
+    const b = normalizeUsageRecord(diskRec);
+    if (b.resetAt > a.resetAt) return b;
+    if (a.resetAt > b.resetAt) return a;
+    const today = todayKey();
+    const aDay = a.lastDay === today;
+    const bDay = b.lastDay === today;
+    return {
+        up: Math.max(a.up, b.up),
+        down: Math.max(a.down, b.down),
+        reqs: Math.max(a.reqs, b.reqs),
+        dUp: Math.max(aDay ? a.dUp : 0, bDay ? b.dUp : 0),
+        dDown: Math.max(aDay ? a.dDown : 0, bDay ? b.dDown : 0),
+        dReqs: Math.max(aDay ? a.dReqs : 0, bDay ? b.dReqs : 0),
+        lastDay: aDay || bDay ? today : a.lastDay,
+        resetAt: a.resetAt
+    };
+}
+
+// mergeUsage folds a freshly loaded usage snapshot into the live in-memory cache.
+function mergeUsage(loaded) {
+    const memAccounts = (sysUsageCache && sysUsageCache.accounts) || {};
+    const diskAccounts = (loaded && loaded.accounts) || {};
+    const ids = new Set([...Object.keys(memAccounts), ...Object.keys(diskAccounts)]);
+    const accounts = {};
+    for (const id of ids) {
+        accounts[id] = mergeUsageRecord(memAccounts[id], diskAccounts[id]);
+    }
+    return { accounts };
+}
+
+// usedBytesOf returns the most accurate total for an account: real measured
+// bytes when available, otherwise the legacy per-request estimate.
+function usedBytesOf(usage) {
+    const real = (usage.up || 0) + (usage.down || 0);
+    if (real > 0) return real;
+    return Math.floor((usage.reqs || 0) * LEGACY_BYTES_PER_REQ);
+}
+
+function configLimitBytes() {
+    if (sysConfig.limitTotalBytes) return Math.max(0, Math.floor(sysConfig.limitTotalBytes));
+    return Math.floor((sysConfig.limitTotalReq || 0) * LEGACY_BYTES_PER_REQ);
+}
+
+// accountUsageSnapshot is the single source of truth for usage numbers shown to
+// the panel, subscription headers and the worker dashboard.
+function accountUsageSnapshot() {
+    const id = activeDeviceId.replace(/-/g, "").toLowerCase();
+    const usage = normalizeUsageRecord(sysUsageCache?.accounts?.[id]);
+    const sameDay = usage.lastDay === todayKey();
+    const up = usage.up;
+    const down = usage.down;
+    const real = up > 0 || down > 0;
+    const reqs = usage.reqs;
+    const legacyTotal = Math.floor(reqs * LEGACY_BYTES_PER_REQ);
+    const total = real ? up + down : legacyTotal;
+    const dUp = sameDay ? usage.dUp : 0;
+    const dDown = sameDay ? usage.dDown : 0;
+    const dReqs = sameDay ? usage.dReqs : 0;
+    const dailyReal = dUp > 0 || dDown > 0;
+    const dailyTotal = dailyReal ? dUp + dDown : Math.floor(dReqs * LEGACY_BYTES_PER_REQ);
+    const limitBytes = configLimitBytes();
+    return {
+        upload: real ? up : 0,
+        download: real ? down : legacyTotal,
+        total,
+        dailyUpload: dUp,
+        dailyDownload: dDown,
+        dailyTotal,
+        reqs,
+        dailyReqs: dReqs,
+        limitBytes,
+        remainingBytes: limitBytes ? Math.max(0, limitBytes - total) : 0,
+        expiryMs: sysConfig.expiryMs || 0,
+        gb: Number((total / GIB).toFixed(2)),
+        limitGb: limitBytes ? Number((limitBytes / GIB).toFixed(2)) : 0
+    };
+}
+
+function ensureUsageRecord(id) {
+    if (!sysUsageCache.accounts) sysUsageCache.accounts = {};
+    let usage = sysUsageCache.accounts[id];
+    if (!usage) {
+        usage = sysUsageCache.accounts[id] = normalizeUsageRecord(null);
+    }
+    const today = todayKey();
+    if (usage.lastDay !== today) {
+        usage.dUp = 0;
+        usage.dDown = 0;
+        usage.dReqs = 0;
+        usage.lastDay = today;
+    }
+    return usage;
+}
+
+// enforceAndPersist applies expiry / traffic-limit auto-disable based on the
+// precise byte total and persists the usage cache to D1 at most every
+// USAGE_PERSIST_INTERVAL to avoid hammering the database on every chunk.
+function enforceAndPersist(usage, env, ctx) {
+    const now = Date.now();
+    if (now - lastSysUsageSync <= USAGE_PERSIST_INTERVAL) return;
+    lastSysUsageSync = now;
+
+    let changedConfig = false;
+    if (!sysConfig.account.isPaused) {
+        let reason = null;
+        if (sysConfig.expiryMs && now > sysConfig.expiryMs) {
+            reason = `Expiration date reached (${new Date(sysConfig.expiryMs).toLocaleDateString()})`;
+        } else {
+            const limitBytes = configLimitBytes();
+            const usedBytes = usedBytesOf(usage);
+            if (limitBytes && usedBytes >= limitBytes) {
+                const usedGB = (usedBytes / GIB).toFixed(2);
+                const limitGB = (limitBytes / GIB).toFixed(2);
+                reason = `Traffic limit exceeded (${usedGB}GB / ${limitGB}GB)`;
+            }
+        }
+        if (reason) {
+            sysConfig.account.isPaused = true;
+            sysConfig.account.disabledReason = reason;
+            sysConfig.account.disabledAt = now;
+            changedConfig = true;
+            ctx?.waitUntil(logActivity(env, "Account Auto-Disabled", `Single account disabled: ${reason}`).catch(() => {}));
+        }
+    }
+
+    if (env?.IOT_DB) {
+        if (changedConfig) ctx?.waitUntil(cachedD1Put(env, "sys_config", JSON.stringify(sysConfig)).catch(() => {}));
+        ctx?.waitUntil(cachedD1Put(env, "sys_usage", JSON.stringify(sysUsageCache)).catch(() => {}));
+    }
+}
+
+// trackBytes records real proxied traffic (upload = client->remote,
+// download = remote->client) for an account.
+function trackBytes(uuid, up, down, env, ctx) {
+    up = Math.max(0, Math.floor(Number(up) || 0));
+    down = Math.max(0, Math.floor(Number(down) || 0));
+    if (up === 0 && down === 0) return;
+    const id = uuid.replace(/-/g, "").toLowerCase();
+    const usage = ensureUsageRecord(id);
+    usage.up += up;
+    usage.down += down;
+    usage.dUp += up;
+    usage.dDown += down;
+    enforceAndPersist(usage, env, ctx);
+}
+
+// trackConnection counts a new proxy handshake. Connection counts are kept for
+// diagnostics and as a legacy fallback; they no longer drive volume accounting.
+function trackConnection(uuid, env, ctx) {
+    const id = uuid.replace(/-/g, "").toLowerCase();
+    const usage = ensureUsageRecord(id);
+    usage.reqs += 1;
+    usage.dReqs += 1;
+    enforceAndPersist(usage, env, ctx);
 }
 
 async function loadSysConfig(env) {
@@ -1416,7 +1605,8 @@ async function loadSysConfig(env) {
         if (now - sysUsageCacheTime > CACHE_TTL_USAGE) {
             if (!sysUsageLoading) {
                 sysUsageLoading = d1Get(env, "sys_usage").then(ustored => {
-                    setSysUsageCache(normalizeUsage(ustored ? JSON.parse(ustored) : null));
+                    const loaded = normalizeUsage(ustored ? JSON.parse(ustored) : null);
+                    setSysUsageCache(mergeUsage(loaded));
                     sysUsageCacheTime = Date.now();
                 }).catch(() => {
                     setSysUsageCache({ accounts: {} });
@@ -1478,61 +1668,26 @@ async function readLogs(env) {
     return stored ? JSON.parse(stored) : [];
 }
 
-async function trackUsage(uuid, bytes, env, ctx) {
-    if (!sysUsageCache.accounts) sysUsageCache.accounts = {};
-    const id = uuid.replace(/-/g, "").toLowerCase();
-    if (!sysUsageCache.accounts[id]) {
-        sysUsageCache.accounts[id] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split("T")[0] };
-    }
-
-    const usage = sysUsageCache.accounts[id];
-    const today = new Date().toISOString().split("T")[0];
-    if (usage.lastDay !== today) {
-        usage.dReqs = 0;
-        usage.lastDay = today;
-    }
-    usage.reqs = usage.reqs || 0;
-    usage.dReqs = usage.dReqs || 0;
-
+// trackUsage is kept for backward compatibility. A bytes value of 0 records a
+// connection handshake; a positive value is treated as download bytes.
+function trackUsage(uuid, bytes, env, ctx) {
     if (bytes === 0) {
-        usage.reqs += 1;
-        usage.dReqs += 1;
-    }
-
-    const now = Date.now();
-    if (now - lastSysUsageSync <= 30000) return;
-    lastSysUsageSync = now;
-
-    let changedConfig = false;
-    if (!sysConfig.account.isPaused) {
-        let reason = null;
-        if (sysConfig.expiryMs && Date.now() > sysConfig.expiryMs) {
-            reason = `Expiration date reached (${new Date(sysConfig.expiryMs).toLocaleDateString()})`;
-        } else if (sysConfig.limitTotalReq && usage.reqs >= sysConfig.limitTotalReq) {
-            const usedGB = (usage.reqs / 6000).toFixed(2);
-            const limitGB = (sysConfig.limitTotalReq / 6000).toFixed(2);
-            reason = `Traffic limit exceeded (${usedGB}GB / ${limitGB}GB)`;
-        }
-        if (reason) {
-            sysConfig.account.isPaused = true;
-            sysConfig.account.disabledReason = reason;
-            sysConfig.account.disabledAt = Date.now();
-            changedConfig = true;
-            ctx?.waitUntil(logActivity(env, "Account Auto-Disabled", `Single account disabled: ${reason}`).catch(() => {}));
-        }
-    }
-
-    if (env?.IOT_DB) {
-        if (changedConfig) ctx?.waitUntil(cachedD1Put(env, "sys_config", JSON.stringify(sysConfig)).catch(() => {}));
-        ctx?.waitUntil(cachedD1Put(env, "sys_usage", JSON.stringify(sysUsageCache)).catch(() => {}));
+        trackConnection(uuid, env, ctx);
+    } else {
+        trackBytes(uuid, 0, bytes, env, ctx);
     }
 }
 
 async function resetAccountTraffic(env) {
     const id = activeDeviceId.replace(/-/g, "").toLowerCase();
     if (!sysUsageCache.accounts) sysUsageCache.accounts = {};
-    sysUsageCache.accounts[id] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split("T")[0] };
+    const fresh = normalizeUsageRecord(null);
+    // Stamp the reset so other isolates adopt the zeroed counters on reload
+    // instead of resurrecting their higher in-memory totals via max-merge.
+    fresh.resetAt = Date.now();
+    sysUsageCache.accounts[id] = fresh;
     delete sysUsageCache.users;
+    lastSysUsageSync = 0;
     await cachedD1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
 }
 
@@ -1598,42 +1753,44 @@ function subscriptionBase(request) {
 }
 
 function accountUsage() {
-    const cleanId = activeDeviceId.replace(/-/g, "").toLowerCase();
-    const usage = sysUsageCache?.accounts?.[cleanId] || { reqs: 0, dReqs: 0, lastDay: "" };
-    const today = new Date().toISOString().split("T")[0];
-    const totalBytes = Math.floor((usage.reqs || 0) * (1073741824 / 6000));
-    const dailyBytes = Math.floor((usage.lastDay === today ? (usage.dReqs || 0) : 0) * (1073741824 / 6000));
-    const limitBytes = Math.floor((sysConfig.limitTotalReq || 0) * (1073741824 / 6000));
+    const snap = accountUsageSnapshot();
     return {
-        totalRequests: usage.reqs || 0,
-        totalGB: Number(((usage.reqs || 0) / 6000).toFixed(2)),
-        totalBytes,
-        total: totalBytes,
-        uploadBytes: 0,
-        downloadBytes: totalBytes,
-        dailyRequests: usage.lastDay === today ? (usage.dReqs || 0) : 0,
-        dailyGB: Number(((usage.lastDay === today ? (usage.dReqs || 0) : 0) / 6000).toFixed(2)),
-        dailyBytes,
-        daily: usage.lastDay === today ? (usage.dReqs || 0) : 0,
+        totalRequests: snap.reqs,
+        totalGB: snap.gb,
+        totalBytes: snap.total,
+        total: snap.total,
+        uploadBytes: snap.upload,
+        downloadBytes: snap.download,
+        dailyRequests: snap.dailyReqs,
+        dailyGB: Number((snap.dailyTotal / 1073741824).toFixed(2)),
+        dailyBytes: snap.dailyTotal,
+        dailyUploadBytes: snap.dailyUpload,
+        dailyDownloadBytes: snap.dailyDownload,
+        daily: snap.dailyReqs,
         totalLimitRequests: sysConfig.limitTotalReq || 0,
-        totalLimitGB: sysConfig.limitTotalReq ? Number((sysConfig.limitTotalReq / 6000).toFixed(2)) : 0,
-        totalLimitBytes: limitBytes,
-        limit: limitBytes,
+        totalLimitGB: snap.limitGb,
+        totalLimitBytes: snap.limitBytes,
+        limit: snap.limitBytes,
         dailyLimit: 0,
-        remainingBytes: limitBytes ? Math.max(0, limitBytes - totalBytes) : 0,
-        expiryMs: sysConfig.expiryMs || 0
+        remainingBytes: snap.remainingBytes,
+        expiryMs: snap.expiryMs
     };
 }
 
 function accountPayload(request) {
     const isExpired = !!(sysConfig.expiryMs && Date.now() > sysConfig.expiryMs);
     let status = "active";
+    let disabledReason = sysConfig.account?.disabledReason || null;
     if (sysConfig.isPaused || sysConfig.account?.isPaused) status = "paused";
-    else if (isExpired) status = "expired";
+    else if (isExpired) {
+        status = "paused";
+        disabledReason = disabledReason || `Expiration date reached (${new Date(sysConfig.expiryMs).toLocaleDateString()})`;
+    }
     return {
         ...sysConfig.account,
         id: activeDeviceId,
         status,
+        disabledReason,
         usage: accountUsage(),
         subscriptionUrl: subscriptionBase(request)
     };
@@ -1675,7 +1832,9 @@ function mergeConfigPatch(patch) {
         }
     }
     if (patch.trafficLimitGB !== undefined) {
-        next.limitTotalReq = patch.trafficLimitGB ? Math.floor(Number(patch.trafficLimitGB) * 6000) : 0;
+        const gb = patch.trafficLimitGB ? Number(patch.trafficLimitGB) : 0;
+        next.limitTotalReq = gb ? Math.floor(gb * 6000) : 0;
+        next.limitTotalBytes = gb ? Math.floor(gb * 1073741824) : 0;
     }
     if (patch.expiryDays !== undefined) {
         next.expiryMs = patch.expiryDays ? Date.now() + Number(patch.expiryDays) * 86400000 : 0;
@@ -1787,7 +1946,12 @@ async function handleAccountApi(request, env, ctx) {
         const patch = body?.account || body || {};
         const next = mergeConfigPatch({ account: patch });
         if (patch.limitTotalReq !== undefined) next.limitTotalReq = Number(patch.limitTotalReq || 0);
-        if (patch.trafficLimitGB !== undefined) next.limitTotalReq = patch.trafficLimitGB ? Math.floor(Number(patch.trafficLimitGB) * 6000) : 0;
+        if (patch.limitTotalBytes !== undefined) next.limitTotalBytes = Number(patch.limitTotalBytes || 0);
+        if (patch.trafficLimitGB !== undefined) {
+            const gb = patch.trafficLimitGB ? Number(patch.trafficLimitGB) : 0;
+            next.limitTotalReq = gb ? Math.floor(gb * 6000) : 0;
+            next.limitTotalBytes = gb ? Math.floor(gb * 1073741824) : 0;
+        }
         if (patch.expiryMs !== undefined) next.expiryMs = Number(patch.expiryMs || 0);
         if (patch.expiryDays !== undefined) next.expiryMs = patch.expiryDays ? Date.now() + Number(patch.expiryDays) * 86400000 : 0;
         await saveConfig(env, next);
@@ -2074,10 +2238,9 @@ async function serveMaintenancePage(request, url, sysConfig) {
 }
 
 function serveSubscriptionInfoPage(account, host, url, sysUsageCache, activeDeviceId, sysConfig) {
-    const idClean = activeDeviceId.replace(/-/g, "").toLowerCase();
-    const usage = sysUsageCache?.accounts?.[idClean] || { reqs: 0, dReqs: 0, lastDay: "" };
-    const totalGb = ((usage.reqs || 0) / 6000).toFixed(2);
-    const limitGb = sysConfig.limitTotalReq ? (sysConfig.limitTotalReq / 6000).toFixed(2) : "Unlimited";
+    const snap = accountUsageSnapshot();
+    const totalGb = (snap.total / 1073741824).toFixed(2);
+    const limitGb = snap.limitBytes ? (snap.limitBytes / 1073741824).toFixed(2) : "Unlimited";
     const expiry = sysConfig.expiryMs ? new Date(sysConfig.expiryMs).toISOString().split("T")[0] : "Never";
     const status = sysConfig.isPaused || account.isPaused ? "Paused" : (sysConfig.expiryMs && Date.now() > sysConfig.expiryMs ? "Expired" : "Active");
     const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Mezdia Panel Subscription</title><style>body{margin:0;background:#0c1116;color:#e8edf2;font-family:system-ui;padding:28px}.card{max-width:680px;margin:auto;background:#141b22;border:1px solid #2a3540;border-radius:8px;padding:22px}code{background:#0b1015;border:1px solid #2a3540;border-radius:6px;padding:2px 5px;word-break:break-all}.row{margin:12px 0;color:#92a0ad}</style></head><body><div class="card"><h1>Mezdia Panel</h1><p class="row">Account: <strong>${account.name || "Default"}</strong></p><p class="row">Status: <strong>${status}</strong></p><p class="row">Traffic: <strong>${totalGb} GB / ${limitGb} GB</strong></p><p class="row">Expiry: <strong>${expiry}</strong></p><p class="row">Subscription URL:</p><p><code>https://${host}/${sysConfig.apiRoute}</code></p></div></body></html>`;
@@ -2086,6 +2249,15 @@ function serveSubscriptionInfoPage(account, host, url, sysUsageCache, activeDevi
 
 
 /* ---- src/stream.js ---- */
+
+const USAGE_FLUSH_BYTES = 256 * 1024;
+
+function byteLen(data) {
+    if (!data) return 0;
+    if (typeof data.byteLength === "number") return data.byteLength;
+    if (typeof data.length === "number") return data.length;
+    return 0;
+}
 
 async function processTelemetryStream(env, ctx) {
     const [client, webSocket] = Object.values(new WebSocketPair());
@@ -2097,10 +2269,31 @@ async function processTelemetryStream(env, ctx) {
 
 async function startDataPipe(webSocket, env, ctx) {
     incrementActiveConnections();
-    webSocket.addEventListener('close', () => decrementActiveConnections());
-    webSocket.addEventListener('error', () => decrementActiveConnections());
     let remoteSocket, dataWriter, isInit = true, queue = Promise.resolve();
     let activeClientHash = null;
+    let pendingUp = 0, pendingDown = 0;
+
+    // meter accumulates real proxied bytes and flushes them to the usage store
+    // in batches to keep per-chunk overhead low.
+    function meter(up, down) {
+        pendingUp += up;
+        pendingDown += down;
+        if (pendingUp + pendingDown >= USAGE_FLUSH_BYTES) flushUsage();
+    }
+    function flushUsage() {
+        if (activeClientHash && (pendingUp > 0 || pendingDown > 0)) {
+            trackBytes(activeClientHash, pendingUp, pendingDown, env, ctx);
+            pendingUp = 0;
+            pendingDown = 0;
+        }
+    }
+    function teardown() {
+        flushUsage();
+        decrementActiveConnections();
+    }
+
+    webSocket.addEventListener('close', teardown);
+    webSocket.addEventListener('error', teardown);
     webSocket.addEventListener("message", (event) => {
         queue = queue.then(async () => {
             try {
@@ -2109,6 +2302,7 @@ async function startDataPipe(webSocket, env, ctx) {
                     const isModeAlpha = await parseSensorData(event.data);
                     if (isModeAlpha) webSocket.send(new Uint8Array([0, 0]));
                 } else if (dataWriter) {
+                    meter(byteLen(event.data), 0);
                     await dataWriter.write(event.data);
                 }
             } catch (err) { webSocket.close(); }
@@ -2128,8 +2322,8 @@ async function startDataPipe(webSocket, env, ctx) {
             if (!activeProfile) return false; // DROP IF INVALID PROFILE
             
             activeClientHash = clientHash;
-            trackUsage(activeClientHash, 0, env, ctx);
-            
+            trackConnection(activeClientHash, env, ctx);
+
             let uTrack = uuidUsage.get(clientHash) || { connects: 0, last: 0 };
             uTrack.connects++;
             uTrack.last = Date.now();
@@ -2154,7 +2348,7 @@ async function startDataPipe(webSocket, env, ctx) {
             if (!activeProfile) return false;
             
             activeClientHash = activeProfile.id.replace(/-/g, '').toLowerCase();
-            trackUsage(activeClientHash, 0, env, ctx);
+            trackConnection(activeClientHash, env, ctx);
             let uTrack = uuidUsage.get(activeClientHash) || { connects: 0, last: 0 };
             uTrack.connects++;
             uTrack.last = Date.now();
@@ -2208,11 +2402,13 @@ async function startDataPipe(webSocket, env, ctx) {
         dataWriter = remoteSocket.writable.getWriter();
         if (offset < bufferData.byteLength) {
             let chunk = bufferData.slice(offset);
+            meter(byteLen(chunk), 0);
             await dataWriter.write(chunk);
         }
-        remoteSocket.readable.pipeTo(new WritableStream({ write(chunk) { 
-            webSocket.send(chunk); 
-        } }));
+        remoteSocket.readable.pipeTo(new WritableStream({ write(chunk) {
+            meter(0, byteLen(chunk));
+            webSocket.send(chunk);
+        } })).catch(() => {}).finally(() => flushUsage());
 
         return isModeAlpha;
     }
@@ -2260,12 +2456,9 @@ async function serveSubscription(request, url) {
 
     const resHeaders = new Headers(corsHeaders());
     resHeaders.set("Cache-Control", "no-store");
-    const idClean = activeDeviceId.replace(/-/g, "").toLowerCase();
-    const usage = sysUsageCache?.accounts?.[idClean] || { reqs: 0, dReqs: 0 };
-    const usedBytes = Math.floor((usage.reqs || 0) * (1073741824 / 6000));
-    const limitBytes = Math.floor((sysConfig.limitTotalReq || 0) * (1073741824 / 6000));
+    const snap = accountUsageSnapshot();
     const expireSec = sysConfig.expiryMs ? Math.floor(sysConfig.expiryMs / 1000) : 0;
-    const subUserInfo = `upload=0; download=${usedBytes}; total=${limitBytes}; expire=${expireSec}`;
+    const subUserInfo = `upload=${snap.upload}; download=${snap.download}; total=${snap.limitBytes}; expire=${expireSec}`;
     resHeaders.set("Subscription-UserInfo", subUserInfo);
     resHeaders.set("subscription-userinfo", subUserInfo);
     resHeaders.set("Profile-Update-Interval", "12");
@@ -2367,6 +2560,7 @@ export default {
 
             if (isTelemetryStream) {
                 if (sysConfig.isPaused || sysConfig.account?.isPaused) return new Response(null, { status: 503 });
+                if (sysConfig.expiryMs && Date.now() > sysConfig.expiryMs) return new Response(null, { status: 503 });
                 return processTelemetryStream(env, ctx);
             }
 
