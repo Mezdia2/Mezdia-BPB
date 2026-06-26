@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
 
 /* ---- src/config.js ---- */
 const BRAND_NAME = "Mezdia Panel";
-const CURRENT_VERSION = "3.0.0";
+const CURRENT_VERSION = "4.2.0";
 
 const SYSTEM_DEFAULTS = {
     name: "Mezdia Panel",
@@ -379,6 +379,14 @@ function calcEffectiveIps(ips, maxCfg, effectiveMode, effectivePorts) {
     return ips.slice(0, neededIps);
 }
 
+function configEndpoints(cleanIps, proxyIps, maxCfg, effectiveMode, effectivePorts) {
+    let source = proxyIps.length > 0 ? proxyIps : cleanIps;
+    return calcEffectiveIps(source, maxCfg, effectiveMode, effectivePorts).map(ip => ({
+        ip,
+        proxyIp: proxyIps.length > 0 ? ip : null
+    }));
+}
+
 async function buildUriProfile(hostName, targetSub = null, allowInsecure = false) {
     let allHostNames = [hostName];
     if (sysConfig.slaveNodes) allHostNames.push(...sysConfig.slaveNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean));
@@ -409,17 +417,15 @@ async function buildUriProfile(hostName, targetSub = null, allowInsecure = false
 
         allHostNames.forEach(hName => {
             let allIps = getCleanIps(hName, p.cleanIp);
-            let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts);
+            let endpoints = configEndpoints(allIps, pips, maxCfg, effectiveMode, effectivePorts);
             effectivePorts.forEach(port => {
                 let sec = getTransportParams(port);
                 let extBase = `encryption=none&security=${sec}&sni=${hName}&fp=${sysConfig.agent}&type=ws&host=${hName}&path=${reqPath}`;
                 if (sysConfig.enableOpt2) extBase += `&pbk=enabled`;
                 extBase += `&allowInsecure=${allowInsecure ? "1" : "0"}`;
-                ips.forEach(ip => {
-                    let selectedProxyIp = null;
-                    if (pips.length > 0) {
-                        selectedProxyIp = pips[configIndex % pips.length];
-                    }
+                endpoints.forEach(endpoint => {
+                    let ip = endpoint.ip;
+                    let selectedProxyIp = endpoint.proxyIp;
                     let vName = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp);
                     let tName = getConfigName("beta", p.name, port, hName, ip, selectedProxyIp);
                     configIndex++;
@@ -483,14 +489,12 @@ async function buildYamlProfile(hostName, targetSub = null, allowInsecure = fals
 
         allHostNames.forEach(hName => {
             let allIps = getCleanIps(hName, p.cleanIp);
-            let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts);
+            let endpoints = configEndpoints(allIps, pips, maxCfg, effectiveMode, effectivePorts);
             effectivePorts.forEach(port => {
                 let sec = getTransportParams(port) === "tls" ? "true" : "false";
-                ips.forEach(ip => {
-                    let selectedProxyIp = null;
-                    if (pips.length > 0) {
-                        selectedProxyIp = pips[configIndex % pips.length];
-                    }
+                endpoints.forEach(endpoint => {
+                    let ip = endpoint.ip;
+                    let selectedProxyIp = endpoint.proxyIp;
                     if (effectiveMode === "alpha" || effectiveMode === "both") {
                         let vName = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp);
                         vName = getUniqueName(vName);
@@ -686,16 +690,14 @@ async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure =
 
         allHostNames.forEach(hName => {
             let allIps = getCleanIps(hName, p.cleanIp);
-            let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts);
+            let endpoints = configEndpoints(allIps, pips, maxCfg, effectiveMode, effectivePorts);
             effectivePorts.forEach(port => {
                 let sec = getTransportParams(port) === "tls";
-                ips.forEach(ip => {
+                endpoints.forEach(endpoint => {
+                    let ip = endpoint.ip;
+                    let selectedProxyIp = endpoint.proxyIp;
                     let isVless = effectiveMode === "alpha" || effectiveMode === "both";
                     let isTrojan = effectiveMode === "beta" || effectiveMode === "both";
-                    let selectedProxyIp = null;
-                    if (pips.length > 0) {
-                        selectedProxyIp = pips[configIndex % pips.length];
-                    }
 
                     if (isVless) {
                         let tagStr = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp);
@@ -976,16 +978,14 @@ async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure
 
         allHostNames.forEach(hName => {
             let allIps = getCleanIps(hName, p.cleanIp);
-            let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts);
+            let endpoints = configEndpoints(allIps, pips, maxCfg, effectiveMode, effectivePorts);
             effectivePorts.forEach(port => {
                 let sec = getTransportParams(port) === "tls";
-                ips.forEach(ip => {
+                endpoints.forEach(endpoint => {
+                    let ip = endpoint.ip;
+                    let selectedProxyIp = endpoint.proxyIp;
                     let isVless = effectiveMode === "alpha" || effectiveMode === "both";
                     let isTrojan = effectiveMode === "beta" || effectiveMode === "both";
-                    let selectedProxyIp = null;
-                    if (pips.length > 0) {
-                        selectedProxyIp = pips[configIndex % pips.length];
-                    }
 
                     if (isVless) {
                         let tagStr = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp);
