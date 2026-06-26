@@ -2461,8 +2461,8 @@ async function serveSubscription(request, url) {
     const subUserInfo = `upload=${snap.upload}; download=${snap.download}; total=${snap.limitBytes}; expire=${expireSec}`;
     resHeaders.set("Subscription-UserInfo", subUserInfo);
     resHeaders.set("subscription-userinfo", subUserInfo);
-    resHeaders.set("Profile-Update-Interval", "12");
-    resHeaders.set("profile-update-interval", "12");
+    resHeaders.set("Profile-Update-Interval", "1");
+    resHeaders.set("profile-update-interval", "1");
     const fileName = encodeURIComponent(sysConfig.account?.name || "Mezdia");
     resHeaders.set("Content-Disposition", `attachment; filename="${fileName}"; filename*=UTF-8''${fileName}`);
 
